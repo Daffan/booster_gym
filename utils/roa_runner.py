@@ -9,7 +9,7 @@ import signal
 import imageio
 import torch
 import torch.nn.functional as F
-from utils.model import *
+from utils.model_roa import *
 from utils.buffer import ExperienceBuffer
 from utils.utils import discount_values, surrogate_loss
 from utils.recorder import Recorder
@@ -29,8 +29,27 @@ class Runner:
 
         self.device = self.cfg["basic"]["rl_device"]
         self.learning_rate = self.cfg["algorithm"]["learning_rate"]
-        self.model = ActorCritic(self.env.num_actions, self.env.num_obs, self.env.num_privileged_obs).to(self.device)
+        self.dagger_update_freq = self.cfg["algorithm"]["dagger_update_freq"]
+        num_obs, num_critic_obs, num_priv, num_hist, num_prop = self.env.get_obs_info()
+        self.model = ActorCriticHistory(
+            self.env.num_obs,
+            self.env.num_privileged_obs,
+            self.env.num_actions,
+            actor_hidden_dims=[256, 128, 128],
+            critic_hidden_dims=[256, 256, 128],
+            num_priv=num_priv,
+            num_hist=num_hist,
+            num_prop=num_prop,
+        ).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+
+        # Adaptation
+        self.hist_encoder_optimizer = torch.optim.Adam(
+            self.model.actor.history_encoder.parameters(), 
+            lr=self.learning_rate
+        )
+        self.priv_reg_coef_schedual = self.cfg["algorithm"]["priv_reg_coef_schedual"]
+
         self._load()
 
         self.buffer = ExperienceBuffer(self.cfg["runner"]["horizon_length"], self.env.num_envs, self.device)
@@ -102,12 +121,13 @@ class Runner:
         obs = obs.to(self.device)
         privileged_obs = infos["privileged_obs"].to(self.device)
         for it in range(self.cfg["basic"]["max_iterations"]):
+            hist_encoding = (it + 1) % self.dagger_update_freq == 0
             # within horizon_length, env.step() is called with same act
             for n in range(self.cfg["runner"]["horizon_length"]):
                 self.buffer.update_data("obses", n, obs)
                 self.buffer.update_data("privileged_obses", n, privileged_obs)
                 with torch.no_grad():
-                    dist = self.model.act(obs)
+                    dist = self.model.act(obs, hist_encoding)
                     act = dist.sample()
                 obs, rew, done, infos = self.env.step(act)
                 obs, rew, done = obs.to(self.device), rew.to(self.device), done.to(self.device)
@@ -124,84 +144,134 @@ class Runner:
                 old_dist = self.model.act(self.buffer["obses"])
                 old_actions_log_prob = old_dist.log_prob(self.buffer["actions"]).sum(dim=-1)
 
-            mean_value_loss = 0
-            mean_actor_loss = 0
-            mean_bound_loss = 0
-            mean_entropy = 0
-            for n in range(self.cfg["runner"]["mini_epochs"]):
-                values = self.model.est_value(self.buffer["obses"], self.buffer["privileged_obses"])
-                last_values = self.model.est_value(obs, privileged_obs)
-                with torch.no_grad():
-                    self.buffer["rewards"][self.buffer["time_outs"]] = values[self.buffer["time_outs"]]
-                    advantages = discount_values(
-                        self.buffer["rewards"],
-                        self.buffer["dones"] | self.buffer["time_outs"],
-                        values,
-                        last_values,
-                        self.cfg["algorithm"]["gamma"],
-                        self.cfg["algorithm"]["lam"],
+            if hist_encoding:
+                mean_hist_latent_loss = 0
+                batch_size = self.buffer["obses"].shape[0]
+
+                for n in range(self.cfg["runner"]["mini_epochs"]):
+                    # Adaptation module update
+                    with torch.inference_mode():
+                        priv_latent_batch = self.model.actor.infer_priv_latent(self.buffer["obses"].reshape(batch_size, -1))
+                    hist_latent_batch = self.model.actor.infer_hist_latent(self.buffer["obses"].reshape(batch_size, -1))
+                    hist_latent_loss = (priv_latent_batch.detach() - hist_latent_batch).norm(p=2, dim=1).mean()
+                    self.hist_encoder_optimizer.zero_grad()
+                    hist_latent_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.actor.history_encoder.parameters(), 1.0)
+                    self.hist_encoder_optimizer.step()
+                    
+                    mean_hist_latent_loss += hist_latent_loss.item()
+            else:
+                mean_value_loss = 0
+                mean_actor_loss = 0
+                mean_bound_loss = 0
+                mean_entropy = 0
+                mean_priv_reg_loss = 0
+                for n in range(self.cfg["runner"]["mini_epochs"]):
+                    values = self.model.est_value(self.buffer["privileged_obses"])
+                    last_values = self.model.est_value(privileged_obs)
+                    with torch.no_grad():
+                        try:
+                            self.buffer["rewards"][self.buffer["time_outs"]] = values[self.buffer["time_outs"]]
+                        except Exception as e:
+                            print(f"Failed to update rewards: {e}")
+                            import ipdb; ipdb.set_trace()
+                        advantages = discount_values(
+                            self.buffer["rewards"],
+                            self.buffer["dones"] | self.buffer["time_outs"],
+                            values,
+                            last_values,
+                            self.cfg["algorithm"]["gamma"],
+                            self.cfg["algorithm"]["lam"],
+                        )
+                        returns = values + advantages
+                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                    value_loss = F.mse_loss(values, returns)
+
+                    # Adaptation module update
+                    batch_size = self.buffer["obses"].shape[0]
+                    priv_latent_batch = self.model.actor.infer_priv_latent(self.buffer["obses"].reshape(batch_size, -1))
+                    with torch.inference_mode():
+                        hist_latent_batch = self.model.actor.infer_hist_latent(self.buffer["obses"].reshape(batch_size, -1))
+                    priv_reg_loss = (priv_latent_batch - hist_latent_batch.detach()).norm(p=2, dim=1).mean()
+                    priv_reg_stage = min(max((it - self.priv_reg_coef_schedual[2]), 0) / self.priv_reg_coef_schedual[3], 1)
+                    priv_reg_coef = priv_reg_stage * (self.priv_reg_coef_schedual[1] - self.priv_reg_coef_schedual[0]) + self.priv_reg_coef_schedual[0]
+
+                    dist = self.model.act(self.buffer["obses"])
+                    actions_log_prob = dist.log_prob(self.buffer["actions"]).sum(dim=-1)
+                    actor_loss = surrogate_loss(old_actions_log_prob, actions_log_prob, advantages)
+
+                    bound_loss = torch.clip(dist.loc - 1.0, min=0.0).square().mean() + torch.clip(dist.loc + 1.0, max=0.0).square().mean()
+
+                    entropy = dist.entropy().sum(dim=-1)
+
+                    loss = (
+                        value_loss
+                        + actor_loss
+                        + self.cfg["algorithm"]["bound_coef"] * bound_loss
+                        + self.cfg["algorithm"]["entropy_coef"] * entropy.mean()
+                        + priv_reg_coef * priv_reg_loss
                     )
-                    returns = values + advantages
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                value_loss = F.mse_loss(values, returns)
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.optimizer.step()
 
-                dist = self.model.act(self.buffer["obses"])
-                actions_log_prob = dist.log_prob(self.buffer["actions"]).sum(dim=-1)
-                actor_loss = surrogate_loss(old_actions_log_prob, actions_log_prob, advantages)
+                    with torch.no_grad():
+                        kl = torch.sum(
+                            torch.log(dist.scale / old_dist.scale)
+                            + 0.5 * (torch.square(old_dist.scale) + torch.square(dist.loc - old_dist.loc)) / torch.square(dist.scale)
+                            - 0.5,
+                            axis=-1,
+                        )
+                        kl_mean = torch.mean(kl)
+                        if kl_mean > self.cfg["algorithm"]["desired_kl"] * 2:
+                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                        elif kl_mean < self.cfg["algorithm"]["desired_kl"] / 2:
+                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                        for param_group in self.optimizer.param_groups:
+                            param_group["lr"] = self.learning_rate
 
-                bound_loss = torch.clip(dist.loc - 1.0, min=0.0).square().mean() + torch.clip(dist.loc + 1.0, max=0.0).square().mean()
-
-                entropy = dist.entropy().sum(dim=-1)
-
-                loss = (
-                    value_loss
-                    + actor_loss
-                    + self.cfg["algorithm"]["bound_coef"] * bound_loss
-                    + self.cfg["algorithm"]["entropy_coef"] * entropy.mean()
+                    mean_value_loss += value_loss.item()
+                    mean_actor_loss += actor_loss.item()
+                    mean_bound_loss += bound_loss.item()
+                    mean_entropy += entropy.mean()
+                    mean_priv_reg_loss += priv_reg_loss.item()
+            if hist_encoding:
+                mean_hist_latent_loss /= self.cfg["runner"]["mini_epochs"]
+                self.recorder.record_statistics(
+                    {
+                        "hist_latent_loss": mean_hist_latent_loss,
+                        "kl_mean": kl_mean,
+                        "lr": self.learning_rate,
+                        "curriculum/mean_lin_vel_level": self.env.mean_lin_vel_level,
+                        "curriculum/mean_ang_vel_level": self.env.mean_ang_vel_level,
+                        "curriculum/max_lin_vel_level": self.env.max_lin_vel_level,
+                        "curriculum/max_ang_vel_level": self.env.max_ang_vel_level,
+                    },
+                    it,
                 )
-                self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
+            else:
+                mean_value_loss /= self.cfg["runner"]["mini_epochs"]
+                mean_actor_loss /= self.cfg["runner"]["mini_epochs"]
+                mean_bound_loss /= self.cfg["runner"]["mini_epochs"]
+                mean_entropy /= self.cfg["runner"]["mini_epochs"]
+                mean_priv_reg_loss /= self.cfg["runner"]["mini_epochs"]
 
-                with torch.no_grad():
-                    kl = torch.sum(
-                        torch.log(dist.scale / old_dist.scale)
-                        + 0.5 * (torch.square(old_dist.scale) + torch.square(dist.loc - old_dist.loc)) / torch.square(dist.scale)
-                        - 0.5,
-                        axis=-1,
-                    )
-                    kl_mean = torch.mean(kl)
-                    if kl_mean > self.cfg["algorithm"]["desired_kl"] * 2:
-                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                    elif kl_mean < self.cfg["algorithm"]["desired_kl"] / 2:
-                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
-
-                mean_value_loss += value_loss.item()
-                mean_actor_loss += actor_loss.item()
-                mean_bound_loss += bound_loss.item()
-                mean_entropy += entropy.mean()
-            mean_value_loss /= self.cfg["runner"]["mini_epochs"]
-            mean_actor_loss /= self.cfg["runner"]["mini_epochs"]
-            mean_bound_loss /= self.cfg["runner"]["mini_epochs"]
-            mean_entropy /= self.cfg["runner"]["mini_epochs"]
-            self.recorder.record_statistics(
-                {
-                    "value_loss": mean_value_loss,
-                    "actor_loss": mean_actor_loss,
-                    "bound_loss": mean_bound_loss,
-                    "entropy": mean_entropy,
-                    "kl_mean": kl_mean,
-                    "lr": self.learning_rate,
-                    "curriculum/mean_lin_vel_level": self.env.mean_lin_vel_level,
-                    "curriculum/mean_ang_vel_level": self.env.mean_ang_vel_level,
-                    "curriculum/max_lin_vel_level": self.env.max_lin_vel_level,
-                    "curriculum/max_ang_vel_level": self.env.max_ang_vel_level,
-                },
-                it,
-            )
+                self.recorder.record_statistics(
+                    {
+                        "value_loss": mean_value_loss,
+                        "actor_loss": mean_actor_loss,
+                        "bound_loss": mean_bound_loss,
+                        "entropy": mean_entropy,
+                        "kl_mean": kl_mean,
+                        "lr": self.learning_rate,
+                        "curriculum/mean_lin_vel_level": self.env.mean_lin_vel_level,
+                        "curriculum/mean_ang_vel_level": self.env.mean_ang_vel_level,
+                        "curriculum/max_lin_vel_level": self.env.max_lin_vel_level,
+                        "curriculum/max_ang_vel_level": self.env.max_ang_vel_level,
+                    },
+                    it,
+                )
 
             if (it + 1) % self.cfg["runner"]["save_interval"] == 0:
                 self.recorder.save(
@@ -228,7 +298,7 @@ class Runner:
                 act = dist.loc
                 obs, rew, done, infos = self.env.step(act)
                 obs, rew, done = obs.to(self.device), rew.to(self.device), done.to(self.device)
-                obss.append(obs.cpu().numpy()[0, :])
+                obss.append(obs[0, :47].cpu().numpy())
             if self.cfg["viewer"]["record_video"]:
                 record_time -= self.env.dt
                 if record_time < 0:

@@ -26,6 +26,9 @@ class ActorCritic(torch.nn.Module):
         )
         self.logstd = torch.nn.parameter.Parameter(torch.full((1, num_act), fill_value=-2.0), requires_grad=True)
 
+        print(f"Actor MLP: {self.actor}")
+        print(f"Critic MLP: {self.critic}")
+
     def act(self, obs):
         action_mean = self.actor(obs)
         action_std = torch.exp(self.logstd).expand_as(action_mean)

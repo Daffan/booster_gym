@@ -18,7 +18,7 @@ class Recorder:
         self.writer = SummaryWriter(os.path.join(self.dir, "summaries"))
         if self.cfg["runner"]["use_wandb"]:
             wandb.init(
-                project=self.cfg["basic"]["task"],
+                project="T1",
                 dir=self.dir,
                 name=name,
                 notes=self.cfg["basic"]["description"],
