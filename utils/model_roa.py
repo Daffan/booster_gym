@@ -92,11 +92,11 @@ class Actor(nn.Module):
             activation,
             num_actions,
             num_priv, num_hist,
-            num_prop, priv_encoder_dims, network="mlp"):
+            num_prop, priv_encoder_dims, network="mlp", hist_encoder="TCN"):
         super().__init__()
         self.num_actions = num_actions
 
-        # Policy
+        # Priv Encoder
         if len(priv_encoder_dims) > 0:
             priv_encoder_layers = []
             priv_encoder_layers.append(nn.Linear(num_priv, priv_encoder_dims[0]))
@@ -113,18 +113,17 @@ class Actor(nn.Module):
         self.num_priv = num_priv
         self.num_hist = num_hist
         self.num_prop = num_prop
-
-        # Priv Encoder
-        # encoder_dim = 8
-        # self.priv_encoder =  nn.Sequential(*[
-        #                         nn.Linear(num_priv, 256), activation,
-        #                         nn.Linear(256, 128), activation,
-        #                         nn.Linear(128, encoder_dim), 
-        #                         # nn.Tanh()
-        #                         nn.LeakyReLU()
-        #                     ])
         
-        self.history_encoder = StateHistoryEncoder(activation, num_prop, num_hist, priv_encoder_output_dim)
+        if hist_encoder == "TCN":
+            self.history_encoder = StateHistoryEncoder(activation, num_prop, num_hist, priv_encoder_output_dim)
+        elif hist_encoder == "MLP":
+            self.history_encoder = nn.Sequential(
+                nn.Linear(num_prop * num_hist, 512), nn.ReLU(),
+                nn.Linear(512, 256), nn.ReLU(),
+                nn.Linear(256, priv_encoder_output_dim), nn.ReLU(),
+            )
+        else:
+            raise(ValueError("hist_encoder must be TCN or MLP"))
 
         # Policy
         if network == "lipsnet":
@@ -192,6 +191,7 @@ class ActorCriticHistory(nn.Module):
                         activation='elu',
                         init_std=-2.0,
                         network="mlp",
+                        hist_encoder="TCN",
                         **kwargs):
         # if kwargs:
         #     print("ActorCritic.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
@@ -213,7 +213,7 @@ class ActorCriticHistory(nn.Module):
             activation,
             num_actions,
             num_priv, num_hist,
-            num_prop, priv_encoder_dims, network)
+            num_prop, priv_encoder_dims, network, hist_encoder)
 
         # Value function
         critic_layers = []

@@ -40,6 +40,7 @@ class Runner:
             num_priv=num_priv,
             num_hist=num_hist,
             num_prop=num_prop,
+            hist_encoder=self.cfg["algorithm"]["hist_encoder"],
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
@@ -120,6 +121,7 @@ class Runner:
         obs, infos = self.env.reset()
         obs = obs.to(self.device)
         privileged_obs = infos["privileged_obs"].to(self.device)
+        priv_reg_coef = 0.0
         for it in range(self.cfg["basic"]["max_iterations"]):
             hist_encoding = (it + 1) % self.dagger_update_freq == 0
             # within horizon_length, env.step() is called with same act
@@ -127,7 +129,8 @@ class Runner:
                 self.buffer.update_data("obses", n, obs)
                 self.buffer.update_data("privileged_obses", n, privileged_obs)
                 with torch.no_grad():
-                    dist = self.model.act(obs, hist_encoding)
+                    # Zifan: try not rollout with hist_encoding when it was not good enough
+                    dist = self.model.act(obs, hist_encoding and (priv_reg_coef) > 0)
                     act = dist.sample()
                 obs, rew, done, infos = self.env.step(act)
                 obs, rew, done = obs.to(self.device), rew.to(self.device), done.to(self.device)
@@ -170,11 +173,7 @@ class Runner:
                     values = self.model.est_value(self.buffer["privileged_obses"])
                     last_values = self.model.est_value(privileged_obs)
                     with torch.no_grad():
-                        try:
-                            self.buffer["rewards"][self.buffer["time_outs"]] = values[self.buffer["time_outs"]]
-                        except Exception as e:
-                            print(f"Failed to update rewards: {e}")
-                            import ipdb; ipdb.set_trace()
+                        self.buffer["rewards"][self.buffer["time_outs"]] = values[self.buffer["time_outs"]]
                         advantages = discount_values(
                             self.buffer["rewards"],
                             self.buffer["dones"] | self.buffer["time_outs"],
@@ -263,6 +262,8 @@ class Runner:
                         "actor_loss": mean_actor_loss,
                         "bound_loss": mean_bound_loss,
                         "entropy": mean_entropy,
+                        "priv_reg_loss": mean_priv_reg_loss,
+                        "priv_reg_coef": priv_reg_coef,
                         "kl_mean": kl_mean,
                         "lr": self.learning_rate,
                         "curriculum/mean_lin_vel_level": self.env.mean_lin_vel_level,

@@ -38,8 +38,9 @@ algorithm:
   entropy_coef: -0.01
   symmetric_coef: 10.
   desired_kl: 0.01
-  priv_reg_coef_schedual: [0, 0.0, 4000, 8000]
-  dagger_update_freq: 2000000000
+  priv_reg_coef_schedual: [0, 0.1, 4000, 8000]
+  dagger_update_freq: 20
+  hist_encoder: "MLP"
 
 sim:
   dt: 0.002
